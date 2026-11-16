@@ -32,9 +32,9 @@ class AppTests(unittest.TestCase):
         self.assertTrue(self.request(self.a,'/api/trees/'+tree)[1]['hasGifted'])
     def test_duplicate_and_point_conflict(self):
         tree=self.tree(); self.gift(self.a,tree)
-        self.assertEqual(self.gift(self.a,tree,1)[1]['code'],'ALREADY_GIFTED')
+        self.assertEqual(self.gift(self.a,tree,1)[0],201)
         self.assertEqual(self.gift(self.b,tree)[1]['code'],'POINT_TAKEN')
-        self.assertEqual(self.gift(self.b,tree,1)[0],201)
+        self.assertEqual(self.gift(self.b,tree,2)[0],201)
         self.assertEqual(self.gift(self.a,self.tree())[0],201)
     def test_invalid_and_missing(self):
         self.assertEqual(self.request(self.a,'/api/trees',{'name':' '})[0],422)
@@ -100,7 +100,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.request(self.b,route,{})[0],403)
         self.assertEqual(self.request(self.a,route,{})[0],200)
         self.assertEqual(self.request(self.a,'/api/trees/'+tree)[1]['ornaments'],[])
-        self.assertEqual(self.gift(self.b,tree,1)[1]['code'],'ALREADY_GIFTED')
+        self.assertEqual(self.gift(self.b,tree,1)[0],201)
     def test_audio_range(self):
         req=urllib.request.Request(self.base+'/assets/music/snowfall.mp3',headers={'Range':'bytes=0-99'})
         with self.a.open(req) as r:
@@ -117,6 +117,52 @@ class AppTests(unittest.TestCase):
         self.base='http://127.0.0.1:'+str(self.server.server_port)
         self.assertTrue(self.request(self.a,'/api/trees/'+tree)[1]['isOwner'])
         self.assertEqual(self.request(self.a,'/api/trees/'+tree+'/ornaments/0/remove',{})[0],200)
+    def test_private_message_owner_sender_and_visitor(self):
+        tree=self.tree()
+        payload={'point':0,'ornament':'ball','name':'发送者','text':'只给你看的秘密','private':True}
+        self.assertEqual(self.request(self.b,'/api/trees/'+tree+'/ornaments',payload)[0],201)
+        for viewer in (self.a,self.b):
+            status,data=self.request(viewer,'/api/trees/'+tree)
+            self.assertEqual(status,200)
+            entry=data['ornaments'][0]
+            self.assertTrue(entry['canRead']); self.assertTrue(entry['private'])
+            self.assertEqual(entry['text'],payload['text'])
+        outsider=self.client()
+        _,data=self.request(outsider,'/api/trees/'+tree)
+        entry=data['ornaments'][0]
+        self.assertFalse(entry['canRead']); self.assertIsNone(entry['text'])
+        self.assertEqual(entry['name'],'发送者'); self.assertEqual(entry['ornament'],'ball')
+        self.assertNotIn(payload['text'],json.dumps(data,ensure_ascii=False))
+        self.assertNotIn('visitor',json.dumps(data)); self.assertNotIn('owner',entry)
+        with outsider.open(self.base+'/api/trees/'+tree) as response:
+            self.assertIn('no-store',response.headers['Cache-Control'])
+    def test_owner_can_make_public_message_private(self):
+        tree=self.tree(); self.gift(self.b,tree)
+        outsider=self.client(); path='/api/trees/'+tree
+        self.assertEqual(self.request(outsider,path)[1]['ornaments'][0]['text'],'圣诞快乐')
+        route=path+'/ornaments/0/privacy'
+        for viewer in (self.b,outsider):
+            self.assertEqual(self.request(viewer,route,{'private':True})[0],403)
+        self.assertEqual(self.request(self.a,route,{'private':True})[0],200)
+        self.assertEqual(self.request(self.a,route,{'private':True})[0],200)
+        self.assertIsNone(self.request(outsider,path)[1]['ornaments'][0]['text'])
+        self.assertEqual(self.request(self.b,path)[1]['ornaments'][0]['text'],'圣诞快乐')
+        self.assertEqual(self.request(self.a,route,{'private':False})[0],422)
+        self.assertEqual(self.request(self.a,path+'/ornaments/37/privacy',{'private':True})[0],404)
+    def test_privacy_value_validation(self):
+        tree=self.tree()
+        for value in ['false',1,None,[],{}]:
+            payload={'point':0,'ornament':'ball','name':'朋友','text':'你好','private':value}
+            self.assertEqual(self.request(self.b,'/api/trees/'+tree+'/ornaments',payload)[0],422)
+        self.assertEqual(self.gift(self.b,tree)[0],201)
+        entry=self.request(self.client(),'/api/trees/'+tree)[1]['ornaments'][0]
+        self.assertFalse(entry['private']); self.assertTrue(entry['canRead'])
+    def test_many_gifts_keep_cumulative_capacity_after_delete(self):
+        tree=self.tree(); self.server.get_app().max_ornaments=2
+        self.assertEqual(self.gift(self.b,tree,0)[0],201)
+        self.assertEqual(self.gift(self.b,tree,1)[0],201)
+        self.assertEqual(self.request(self.a,'/api/trees/'+tree+'/ornaments/0/remove',{})[0],200)
+        self.assertEqual(self.gift(self.b,tree,0)[1]['code'],'CAPACITY')
     def test_health_and_static_cache(self):
         self.assertEqual(self.request(self.a,'/healthz')[0],200)
         response=self.a.open(self.base+'/app.js')
@@ -135,5 +181,74 @@ class AppTests(unittest.TestCase):
         for path in ['/', '/tree/'+tree, '/app.js']:
             self.assertEqual(self.a.open(self.base+path).status,200)
         self.assertEqual(self.request(self.a,'/data/test.db')[0],404)
+
+class MigrationTests(unittest.TestCase):
+    def test_legacy_rows_permissions_and_history_preserved(self):
+        import sqlite3
+        from server import TreeApp
+        with tempfile.TemporaryDirectory() as folder:
+            path=folder+'/old.db'
+            with sqlite3.connect(path) as db:
+                db.executescript("""
+                CREATE TABLE trees(id TEXT PRIMARY KEY,name TEXT NOT NULL,owner TEXT);
+                CREATE TABLE developer_browser(anchor TEXT NOT NULL,visitor TEXT NOT NULL);
+                CREATE TABLE ornaments(tree TEXT NOT NULL REFERENCES trees(id),point INTEGER NOT NULL,ornament TEXT NOT NULL,name TEXT NOT NULL,text TEXT NOT NULL,visitor TEXT NOT NULL,UNIQUE(tree,point),UNIQUE(tree,visitor));
+                CREATE TABLE gift_history(tree TEXT NOT NULL,visitor TEXT NOT NULL,UNIQUE(tree,visitor));
+                INSERT INTO trees VALUES ('abcdefghijklmnop','旧树','owner-hash');
+                INSERT INTO developer_browser VALUES ('abcdefghijklmnop','developer-hash');
+                INSERT INTO ornaments VALUES ('abcdefghijklmnop',0,'star','旧朋友','旧留言','sender-hash');
+                INSERT INTO gift_history VALUES ('abcdefghijklmnop','sender-hash');
+                INSERT INTO gift_history VALUES ('abcdefghijklmnop','removed-sender');
+                """)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(TreeApp,[path,path]))
+            TreeApp(path)
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT name,owner FROM trees').fetchone(),('旧树','owner-hash'))
+                self.assertEqual(db.execute('SELECT visitor FROM developer_browser').fetchone()[0],'developer-hash')
+                self.assertEqual(db.execute('SELECT text,visitor,private FROM ornaments').fetchone(),('旧留言','sender-hash',0))
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0],2)
+                db.execute("INSERT INTO ornaments(tree,point,ornament,name,text,visitor,private) VALUES ('abcdefghijklmnop',1,'ball','朋友','再次留言','sender-hash',1)")
+                db.execute("INSERT INTO gift_history VALUES ('abcdefghijklmnop','sender-hash')")
+            TreeApp(path)
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0],3)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM ornaments').fetchone()[0],2)
+
+    def test_migration_failure_rolls_back_tables_and_version(self):
+        import sqlite3
+        from unittest.mock import patch
+        from server import TreeApp
+        with tempfile.TemporaryDirectory() as folder:
+            path=folder+'/rollback.db'
+            with sqlite3.connect(path) as db:
+                db.executescript("""
+                CREATE TABLE trees(id TEXT PRIMARY KEY,name TEXT NOT NULL,owner TEXT);
+                INSERT INTO trees VALUES ('abcdefghijklmnop','保留树','owner-hash');
+                CREATE TABLE ornaments(tree TEXT NOT NULL,point INTEGER NOT NULL,ornament TEXT NOT NULL,name TEXT NOT NULL,text TEXT NOT NULL,visitor TEXT NOT NULL,UNIQUE(tree,point),UNIQUE(tree,visitor));
+                INSERT INTO ornaments VALUES ('abcdefghijklmnop',0,'star','朋友','保留留言','sender-hash');
+                CREATE TABLE gift_history(tree TEXT NOT NULL,visitor TEXT NOT NULL,UNIQUE(tree,visitor));
+                INSERT INTO gift_history VALUES ('abcdefghijklmnop','sender-hash');
+                """)
+            connect=sqlite3.connect
+            class InterruptedConnection(sqlite3.Connection):
+                def execute(self,sql,*args):
+                    if sql=='ALTER TABLE gift_history_v1 RENAME TO gift_history':
+                        raise sqlite3.OperationalError('simulated migration interruption')
+                    return super().execute(sql,*args)
+            def interrupted_connect(*args,**kwargs):
+                return connect(*args,**kwargs,factory=InterruptedConnection)
+            with patch('server.sqlite3.connect',side_effect=interrupted_connect):
+                with self.assertRaises(sqlite3.OperationalError): TreeApp(path)
+            with connect(path) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],0)
+                self.assertEqual(db.execute('SELECT text FROM ornaments').fetchone()[0],'保留留言')
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0],1)
+                self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name IN ('ornaments_v1','gift_history_v1')").fetchone())
+            TreeApp(path)
+            with connect(path) as db:
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],1)
 
 if __name__ == '__main__': unittest.main()

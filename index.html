@@ -349,6 +349,12 @@ h1{letter-spacing:.035em;text-wrap:balance}
 .gift-sender{position:absolute;left:50%;top:calc(100% + 2px);transform:translateX(-50%);display:block;width:62px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;font-family:var(--sans);font-size:10px;font-weight:400;line-height:14px;letter-spacing:0;color:#efe9dbbf;text-shadow:0 1px 4px #020b08,0 0 6px #020b08;pointer-events:none}
 .hang-point.occupied{overflow:visible}
 @media(max-width:600px){.gift-sender{width:46px;font-size:9px;line-height:12px;top:100%}}
+.privacy-option{display:flex;align-items:flex-start;gap:10px;margin:18px 0 8px;color:var(--ink);font-size:14px;line-height:1.6;cursor:pointer;min-height:32px}
+.privacy-option input{flex:0 0 auto;width:18px;height:18px;margin:3px 0 0;accent-color:var(--gold)}
+.ornament-dialog .privacy-help{font-size:11px;color:var(--muted);line-height:1.7;margin:0 0 16px}
+.ornament-dialog .privacy-status{font-size:12px;color:var(--gold);margin-bottom:12px}
+#privacy-error:empty{display:none}
+@media(max-width:600px){.privacy-option{min-height:44px;align-items:center}.privacy-option input{margin-top:0}}
 </style>
 </head>
 <body>
@@ -1305,7 +1311,7 @@ h1{letter-spacing:.035em;text-wrap:balance}
     </div>
   </main>
 
-  <!-- 选择器只负责选款；留言和正式悬挂会在下一课连接。 -->
+  <!-- 选择装饰、留言与可见范围。 -->
   <dialog class="ornament-dialog" id="ornament-dialog" aria-labelledby="ornament-title">
     <h2 id="ornament-title">挑一枚喜欢的装饰</h2>
     <p>把想说的话，藏进一枚小装饰里。</p>
@@ -1313,17 +1319,25 @@ h1{letter-spacing:.035em;text-wrap:balance}
     <button class="dialog-close" id="close-ornaments">回到树旁</button>
   </dialog>
   <dialog class="ornament-dialog" id="message-dialog" aria-labelledby="message-title">
-    <h2 id="message-title">有句话，想对你说</h2><p>点开装饰的人都能读到留言，请别写下私密信息。</p>
+    <h2 id="message-title">有句话，想对你说</h2><p>每一份心意，都可以选择公开或悄悄送达。</p>
     <form id="message-form">
       <label class="message-field">你的称呼<input id="sender-name" maxlength="24" required placeholder="留下一个熟悉的名字"></label>
       <label class="message-field">留言<textarea id="message-text" maxlength="300" required placeholder="一句祝福，或一件想一起做的小事……（最多 300 字）"></textarea></label>
+      <label class="privacy-option"><input type="checkbox" id="private-message" aria-describedby="private-message-help"><span>仅我和树主人可见</span></label>
+      <p class="privacy-help" id="private-message-help">勾选后只有正文私密，挂饰和名字仍公开。身份依赖当前浏览器，请妥善保管个人信息。</p>
       <button class="decorate-button" type="submit">写好了，挂上树</button>
       <button class="dialog-close" id="cancel-message" type="button">取消</button>
     </form>
   </dialog>
   <dialog class="ornament-dialog" id="read-dialog" aria-labelledby="read-title">
     <h2 id="read-title"></h2>
+    <p class="privacy-status" id="message-visibility"></p>
     <p id="message-content"></p>
+    <div id="owner-private-control" hidden>
+      <label class="privacy-option"><input type="checkbox" id="owner-private-message"><span>仅发送者和我可见</span></label>
+      <p class="privacy-help">设为私密后不能再公开。此前已经读到或保存的内容无法撤回。</p>
+      <p id="privacy-error" role="alert"></p>
+    </div>
     <button class="dialog-close remove-message" id="remove-message" hidden>移除这份留言</button>
     <div id="remove-confirm" hidden><p>移除后，装饰和留言将不再显示。确定移除吗？</p><button class="dialog-close" id="confirm-remove">确定移除</button><button class="dialog-close" id="cancel-remove">保留留言</button></div>
     <p id="remove-error" role="alert"></p>
@@ -1333,7 +1347,7 @@ h1{letter-spacing:.035em;text-wrap:balance}
     <h2 id="create-title">种下你的圣诞树</h2>
     <form id="create-form">
       <label class="message-field">怎么称呼你<input id="owner-name" maxlength="24" required placeholder="例如：16nights"></label>
-      <p>拿到链接的人都能看到树和留言，请别填写私密信息。</p>
+      <p>挂饰和名字公开可见；私密留言正文仅发送者和你可见。</p>
       <p id="create-error" role="alert"></p>
       <button class="decorate-button" type="submit">种下我的树</button>
       <button class="dialog-close" type="button" id="cancel-create">取消</button>

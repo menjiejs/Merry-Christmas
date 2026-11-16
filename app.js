@@ -15,9 +15,9 @@ const messageDialog = $('message-dialog');
 const createDialog = $('create-dialog');
 const successDialog = $('success-dialog');
 const treeId = location.pathname.match(/^\/tree\/([A-Za-z0-9_-]{16})$/)?.[1];
-let ready = false, hasGifted = false, sending = false;
+let ready = false, sending = false;
 let selectedOrnament = null, pendingMessage = null;
-let isOwner = false, viewingPoint = null;
+let isOwner = false, viewingPoint = null, openingMessage = false;
 const messages = new Map();
 const pointButtons = [];
 const rows = [[23,47,53,2],[30,44,56,3],[39,40,60,4],[48,35,65,5],[58,31,69,5],[68,26,74,6],[78,25,75,6],[88,18,82,7]];
@@ -65,7 +65,7 @@ function updateAction() {
   $('create-tree').className = treeId ? 'dialog-close' : 'decorate-button';
   $('create-tree').textContent = treeId ? '我也种一棵' : '种下我的树';
   $('decorate-button').disabled = !ready || sending;
-  $('decorate-button').textContent = !treeId ? '种下我的圣诞树' : hasGifted ? '心意已送达' : '送一枚装饰';
+  $('decorate-button').textContent = !treeId ? '种下我的圣诞树' : '送一枚装饰';
 }
 function cancelPlacement() {
   stage.classList.remove('choosing-point');
@@ -75,7 +75,6 @@ function cancelPlacement() {
 function renderTree(data) {
   messages.clear();
   for (const entry of data.ornaments) messages.set(entry.point,entry);
-  hasGifted = data.hasGifted;
   isOwner = data.isOwner;
   document.querySelector('[data-exclusive]').hidden = !data.isDeveloper;
   const owner = document.createElement('em');
@@ -92,6 +91,20 @@ function renderTree(data) {
     button.setAttribute('aria-label',entry ? `查看${entry.name}的留言` : `选择第 ${index+1} 个挂点`);
   });
   ready = true; updateAction();
+  if ($('read-dialog').open && viewingPoint !== null) {
+    const entry = messages.get(viewingPoint);
+    if (entry) renderOpenedMessage(entry);
+    else { $('message-content').textContent=''; $('read-dialog').close(); }
+  }
+}
+function renderOpenedMessage(entry) {
+  $('remove-message').hidden = !isOwner;
+  $('read-title').textContent = `来自 ${entry.name}`;
+  $('message-visibility').textContent = entry.private ? '仅发送者和树主人可见' : '公开留言';
+  $('message-content').textContent = entry.canRead ? entry.text : '这是一份悄悄送达的心意，只有发送者和树主人可以阅读。';
+  $('owner-private-control').hidden = !isOwner;
+  $('owner-private-message').checked = entry.private;
+  $('owner-private-message').disabled = entry.private;
 }
 async function loadTree() {
   const data = await api(`/api/trees/${treeId}`);
@@ -116,23 +129,29 @@ points.forEach(([x,y],index) => {
   button.addEventListener('click', async () => {
     if (sending) return;
     if (messages.has(index)) {
+      if (openingMessage) return;
+      openingMessage = true;
+      // 打开时重新向服务器确认权限，不使用可能已经改为私密的旧正文。
+      $('message-content').textContent = '';
+      try { await loadTree(); }
+      catch(error) { hint(error.message); return; }
+      finally { openingMessage = false; }
       const entry = messages.get(index);
+      if (!entry) { hint('这份留言已被移除，请选择其他装饰'); return; }
       viewingPoint = index;
-      $('remove-message').hidden = !isOwner;
       $('remove-confirm').hidden = true;
       $('remove-error').textContent = '';
-      $('read-title').textContent = `来自 ${entry.name}`;
-      $('message-content').textContent = entry.text;
+      $('privacy-error').textContent = '';
+      renderOpenedMessage(entry);
       $('read-dialog').showModal(); return;
     }
-    if (!pendingMessage || !selectedOrnament || hasGifted) return;
+    if (!pendingMessage || !selectedOrnament) return;
     sending = true; updateAction(); hint('正在挂上你的心意…');
-    let committed = false;
     try {
       const entry = {...pendingMessage, ornament:selectedOrnament, point:index};
       await api(`/api/trees/${treeId}/ornaments`,entry);
-      committed = true;
-      messages.set(index,entry); hasGifted = true;
+      entry.canRead = true;
+      messages.set(index,entry);
       button.classList.add('occupied'); paintGift(button,entry);
       button.setAttribute('aria-label',`查看${entry.name}的留言`);
       cancelPlacement(); $('message-form').reset();
@@ -140,21 +159,18 @@ points.forEach(([x,y],index) => {
       successDialog.showModal();
       try { await loadTree(); } catch { /* 保存已成功，保留当前显示，稍后同步。 */ }
     } catch (error) {
-      if (error.code === 'POINT_TAKEN' || error.code === 'ALREADY_GIFTED') {
+      if (error.code === 'POINT_TAKEN') {
         try { await loadTree(); } catch { /* 保留原输入供重试。 */ }
       }
-      if (error.code === 'ALREADY_GIFTED') { hasGifted = true; cancelPlacement(); }
       hint(error.message);
     } finally {
       sending = false; updateAction();
-      if (committed) hasGifted = true;
     }
   });
   pointButtons.push(button); stage.append(button);
 });
 $('decorate-button').addEventListener('click', () => {
   if (!treeId) { createDialog.showModal(); return; }
-  if (hasGifted) { hint('你的心意已在树上，点开装饰看看吧'); return; }
   if (messages.size >= points.length) { hint('这棵树已经挂满了心意'); return; }
   cancelPlacement(); picker.showModal();
 });
@@ -162,7 +178,7 @@ $('message-form').addEventListener('submit', event => {
   event.preventDefault();
   const name = $('sender-name').value.trim(), text = $('message-text').value.trim();
   if (!name || !text) { hint('称呼和留言不能只有空格'); return; }
-  pendingMessage = {name,text};
+  pendingMessage = {name,text,private:$('private-message').checked};
   messageDialog.close(); stage.classList.add('choosing-point');
   $('cancel-placement').hidden = false;
   hint('轻点树上的圆点，为心意选个位置');
@@ -203,7 +219,7 @@ async function init() {
   hint('正在寻找这棵树…');
   try {
     await loadTree(); $('share-tree').hidden = false;
-    hint(hasGifted ? '你的心意已在树上，点开装饰看看吧' : '送一枚装饰，留一句想说的话');
+    hint('可以多送几份心意，也可以留一句悄悄话');
   } catch(error) { hint(error.message); }
 }
 // 返回页面时重新读取，让朋友刚挂上的装饰也能出现。
@@ -227,6 +243,23 @@ $('confirm-remove').addEventListener('click', async () => {
     try { await loadTree(); } catch { /* 删除成功，保留当前显示。 */ }
   } catch(error) { $('remove-error').textContent=error.message; }
   finally { $('confirm-remove').disabled=false; }
+});
+// 主人只能收紧可见范围，不会把发送者选择的私密内容公开。
+$('owner-private-message').addEventListener('change',async()=>{
+  const checkbox=$('owner-private-message');
+  if (!isOwner || viewingPoint === null || !checkbox.checked) return;
+  const point=viewingPoint;
+  checkbox.disabled=true; $('privacy-error').textContent='';
+  try {
+    await api(`/api/trees/${treeId}/ornaments/${point}/privacy`,{private:true});
+    const entry=messages.get(point);
+    if (entry) { entry.private=true; if (viewingPoint===point) renderOpenedMessage(entry); }
+    hint('已设为私密，只有发送者和你能读到正文');
+    try { await loadTree(); } catch { /* 权限已保存，保留当前状态。 */ }
+  } catch(error) {
+    checkbox.checked=false; checkbox.disabled=false;
+    $('privacy-error').textContent=error.message;
+  }
 });
 // 不自动播放，也不预下载；音符按钮由真实播放状态更新。
 const bgm=$('winter-bgm'), musicToggle=$('music-toggle');

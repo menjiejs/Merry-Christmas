@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 
 ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger('christmas')
@@ -30,27 +31,66 @@ class TreeApp:
         if self.max_trees<1 or self.max_ornaments<1: raise ValueError('数据上限必须为正数')
         self.slots=threading.BoundedSemaphore(max_inflight)
         Path(self.database).parent.mkdir(parents=True,exist_ok=True)
-        with self.connect() as db:
-            db.execute('PRAGMA journal_mode=WAL')
-            db.executescript('''
-              CREATE TABLE IF NOT EXISTS trees(id TEXT PRIMARY KEY,name TEXT NOT NULL);
-              CREATE TABLE IF NOT EXISTS developer_browser(anchor TEXT NOT NULL,visitor TEXT NOT NULL);
-              CREATE TABLE IF NOT EXISTS ornaments(
-                tree TEXT NOT NULL REFERENCES trees(id),point INTEGER NOT NULL,
-                ornament TEXT NOT NULL,name TEXT NOT NULL,text TEXT NOT NULL,
-                visitor TEXT NOT NULL,UNIQUE(tree,point),UNIQUE(tree,visitor));
-            ''')
-        # 兼容旧数据库；旧树没有创建者证据，不能凭名字认领。
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            columns={row[1] for row in db.execute('PRAGMA table_info(trees)')}
-            if 'owner' not in columns: db.execute('ALTER TABLE trees ADD COLUMN owner TEXT')
-            db.execute('CREATE TABLE IF NOT EXISTS gift_history(tree TEXT NOT NULL,visitor TEXT NOT NULL,UNIQUE(tree,visitor))')
-            db.execute('INSERT OR IGNORE INTO gift_history SELECT tree,visitor FROM ornaments')
+        self.initialize_database()
         self.assets={}
         for name,mime in [('index.html','text/html; charset=utf-8'),('app.js','text/javascript; charset=utf-8')]:
             body=(ROOT/name).read_bytes()
             self.assets[name]=(body,mime,'"'+hashlib.sha256(body).hexdigest()+'"')
+
+    def initialize_database(self):
+        # 整个升级在写事务中完成；失败会回滚，重复启动不会重复迁移。
+        with self.connect() as db:
+            # 切换 WAL 时 SQLite 可能立即报锁冲突；多个进程启动时短暂重试。
+            for attempt in range(8):
+                try:
+                    if db.execute('PRAGMA journal_mode').fetchone()[0].lower()!='wal':
+                        db.execute('PRAGMA journal_mode=WAL')
+                    break
+                except sqlite3.OperationalError as error:
+                    if attempt==7 or not any(word in str(error).lower() for word in ('locked','busy')):
+                        raise
+                    time.sleep(.05*(attempt+1))
+            db.execute('BEGIN IMMEDIATE')
+            version=db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0,1): raise RuntimeError('数据库版本较新，请使用对应版本的程序')
+            db.execute('CREATE TABLE IF NOT EXISTS trees(id TEXT PRIMARY KEY,name TEXT NOT NULL,owner TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS developer_browser(anchor TEXT NOT NULL,visitor TEXT NOT NULL)')
+            columns={row[1] for row in db.execute('PRAGMA table_info(trees)')}
+            if 'owner' not in columns: db.execute('ALTER TABLE trees ADD COLUMN owner TEXT')
+            db.execute("""CREATE TABLE IF NOT EXISTS ornaments(
+                tree TEXT NOT NULL REFERENCES trees(id),point INTEGER NOT NULL,
+                ornament TEXT NOT NULL,name TEXT NOT NULL,text TEXT NOT NULL,
+                visitor TEXT NOT NULL,private INTEGER NOT NULL DEFAULT 0 CHECK(private IN (0,1)),
+                UNIQUE(tree,point))""")
+            db.execute('CREATE TABLE IF NOT EXISTS gift_history(tree TEXT NOT NULL,visitor TEXT NOT NULL)')
+            if version==0:
+                old_count=db.execute('SELECT COUNT(*) FROM ornaments').fetchone()[0]
+                history_count=db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0]
+                db.execute("""CREATE TABLE ornaments_v1(
+                    tree TEXT NOT NULL REFERENCES trees(id),point INTEGER NOT NULL,
+                    ornament TEXT NOT NULL,name TEXT NOT NULL,text TEXT NOT NULL,
+                    visitor TEXT NOT NULL,private INTEGER NOT NULL DEFAULT 0 CHECK(private IN (0,1)),
+                    UNIQUE(tree,point))""")
+                columns={row[1] for row in db.execute('PRAGMA table_info(ornaments)')}
+                privacy='private' if 'private' in columns else '0'
+                db.execute('INSERT INTO ornaments_v1 SELECT tree,point,ornament,name,text,visitor,'+privacy+' FROM ornaments')
+                db.execute('CREATE TABLE gift_history_v1(tree TEXT NOT NULL,visitor TEXT NOT NULL)')
+                db.execute('INSERT INTO gift_history_v1 SELECT tree,visitor FROM gift_history')
+                # 兼容没有历史表的早期版本；保留被删除留言留下的计数。
+                missing=db.execute("""SELECT COUNT(*) FROM ornaments o WHERE NOT EXISTS
+                    (SELECT 1 FROM gift_history_v1 h WHERE h.tree=o.tree AND h.visitor=o.visitor)""").fetchone()[0]
+                db.execute("""INSERT INTO gift_history_v1 SELECT tree,visitor FROM ornaments o WHERE NOT EXISTS
+                    (SELECT 1 FROM gift_history_v1 h WHERE h.tree=o.tree AND h.visitor=o.visitor)""")
+                if db.execute('SELECT COUNT(*) FROM ornaments_v1').fetchone()[0]!=old_count:
+                    raise RuntimeError('留言迁移校验失败')
+                if db.execute('SELECT COUNT(*) FROM gift_history_v1').fetchone()[0]!=history_count+missing:
+                    raise RuntimeError('赠送记录迁移校验失败')
+                db.execute('DROP TABLE ornaments')
+                db.execute('ALTER TABLE ornaments_v1 RENAME TO ornaments')
+                db.execute('DROP TABLE gift_history')
+                db.execute('ALTER TABLE gift_history_v1 RENAME TO gift_history')
+                db.execute('PRAGMA user_version=1')
+            db.execute('CREATE INDEX IF NOT EXISTS history_by_visitor ON gift_history(tree,visitor)')
 
     @contextmanager
     def connect(self):
@@ -132,7 +172,7 @@ class TreeApp:
             if status==304: body=b''
         else:
             body=json.dumps(data,ensure_ascii=False).encode(); mime='application/json; charset=utf-8'
-            headers += [('Cache-Control','no-store')]
+            headers += [('Cache-Control','private, no-store'),('Vary','Cookie')]
         headers += [('Content-Type',mime),('Content-Length',str(len(body)))] + (extra or [])
         start(f'{status} {HTTPStatus(status).phrase}',headers)
         return [body]
@@ -153,10 +193,17 @@ class TreeApp:
             with self.connect() as db:
                 row=db.execute('SELECT name,owner FROM trees WHERE id=?',(tree,)).fetchone()
                 if not row: raise APIError(404,'TREE_NOT_FOUND','这棵树不存在，请确认链接')
-                gifts=db.execute('SELECT point,ornament,name,text FROM ornaments WHERE tree=? ORDER BY point',(tree,)).fetchall()
-                gifted=db.execute('SELECT 1 FROM gift_history WHERE tree=? AND visitor=?',(tree,self.visitor(tree,token))).fetchone() is not None
+                gifts=db.execute('SELECT point,ornament,name,text,visitor,private FROM ornaments WHERE tree=? ORDER BY point',(tree,)).fetchall()
+                viewer=self.visitor(tree,token)
+                gifted=db.execute('SELECT 1 FROM gift_history WHERE tree=? AND visitor=?',(tree,viewer)).fetchone() is not None
                 developer=self.developer(db,token)
-            return 200,{'id':tree,'name':row[0],'hasGifted':gifted,'isDeveloper':developer,'isOwner':bool(row[1] and secrets.compare_digest(row[1],self.visitor(tree,token))),'ornaments':[dict(zip(['point','ornament','name','text'],g)) for g in gifts]},None
+                is_owner=bool(row[1] and secrets.compare_digest(row[1],viewer))
+            entries=[]
+            for point,ornament,name,message,sender,private in gifts:
+                can_read=not private or is_owner or secrets.compare_digest(sender,viewer)
+                entries.append({'point':point,'ornament':ornament,'name':name,
+                                'text':message if can_read else None,'private':bool(private),'canRead':bool(can_read)})
+            return 200,{'id':tree,'name':row[0],'hasGifted':gifted,'isDeveloper':developer,'isOwner':is_owner,'ornaments':entries},None
         if method!='POST': raise APIError(405,'METHOD','不支持这个操作')
         origin=e.get('HTTP_ORIGIN')
         if (origin and urlsplit(origin).netloc!=e.get('HTTP_HOST')) or e.get('HTTP_SEC_FETCH_SITE')=='cross-site':
@@ -181,6 +228,20 @@ class TreeApp:
                     raise APIError(503,'CAPACITY','暂时无法种新树，请晚些再来；已有的树仍可查看')
                 db.execute('INSERT INTO trees(id,name,owner) VALUES (?,?,?)',(tree,data['name'].strip(),self.visitor(tree,token)))
             return 201,{'id':tree},None
+        privacy_change=re.fullmatch(r'/api/trees/([A-Za-z0-9_-]{16})/ornaments/(\d{1,2})/privacy',path)
+        if privacy_change:
+            tree,point=privacy_change[1],int(privacy_change[2])
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                owner=db.execute('SELECT owner FROM trees WHERE id=?',(tree,)).fetchone()
+                if not owner: raise APIError(404,'TREE_NOT_FOUND','这棵树不存在')
+                if not owner[0] or not secrets.compare_digest(owner[0],self.visitor(tree,token)):
+                    raise APIError(403,'OWNER_ONLY','只有树主人可以调整留言可见范围')
+                # 仅允许收紧可见范围，不能把发送者的私密留言公开。
+                if data.get('private') is not True: raise APIError(422,'INVALID','私密留言不能改为公开')
+                if db.execute('UPDATE ornaments SET private=1 WHERE tree=? AND point=?',(tree,point)).rowcount==0:
+                    raise APIError(404,'NOT_FOUND','这枚装饰已经不在树上了')
+            return 200,{'ok':True},None
         removal=re.fullmatch(r'/api/trees/([A-Za-z0-9_-]{16})/ornaments/(\d{1,2})/remove',path)
         if removal:
             tree,point=removal[1],int(removal[2])
@@ -198,15 +259,15 @@ class TreeApp:
         tree=match[1];point=data.get('point')
         if type(point) is not int or not 0<=point<38 or data.get('ornament') not in ('star','ball','bell','moon','candy','stocking') or not text('name',24) or not text('text',300):
             raise APIError(422,'INVALID','请检查装饰、位置和留言内容')
+        if type(data.get('private',False)) is not bool: raise APIError(422,'INVALID','请选择正确的留言可见范围')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             if data['ornament']=='moon' and not self.developer(db,token): raise APIError(403,'EXCLUSIVE','这是 16nights 的专属装饰')
             if not db.execute('SELECT 1 FROM trees WHERE id=?',(tree,)).fetchone(): raise APIError(404,'TREE_NOT_FOUND','这棵树不存在')
-            if db.execute('SELECT 1 FROM gift_history WHERE tree=? AND visitor=?',(tree,self.visitor(tree,token))).fetchone(): raise APIError(409,'ALREADY_GIFTED','你已经给这棵树送过装饰了')
             if db.execute('SELECT 1 FROM ornaments WHERE tree=? AND point=?',(tree,point)).fetchone(): raise APIError(409,'POINT_TAKEN','这个位置刚被选走了，请换一个位置')
             if db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0]>=self.max_ornaments: raise APIError(503,'CAPACITY','新的心意暂时收满了，请晚些再来')
             db.execute('INSERT INTO gift_history VALUES (?,?)',(tree,self.visitor(tree,token)))
-            db.execute('INSERT INTO ornaments VALUES (?,?,?,?,?,?)',(tree,point,data['ornament'],data['name'].strip(),data['text'].strip(),self.visitor(tree,token)))
+            db.execute('INSERT INTO ornaments(tree,point,ornament,name,text,visitor,private) VALUES (?,?,?,?,?,?,?)',(tree,point,data['ornament'],data['name'].strip(),data['text'].strip(),self.visitor(tree,token),int(data.get('private',False))))
         return 201,{'ok':True},None
 
 @lru_cache(maxsize=1)
