@@ -261,7 +261,7 @@ $('owner-private-message').addEventListener('change',async()=>{
     $('privacy-error').textContent=error.message;
   }
 });
-// 不自动播放，也不预下载；音符按钮由真实播放状态更新。
+// 默认尝试播放；浏览器拦截时等待第一次页面交互，手动暂停后不再自动启动。
 const bgm=$('winter-bgm'), musicToggle=$('music-toggle');
 bgm.volume=.3;
 function syncMusic(){
@@ -271,6 +271,7 @@ function syncMusic(){
   musicToggle.title=playing?'暂停冬夜音乐':'播放冬夜音乐';
 }
 musicToggle.addEventListener('click',async()=>{
+  stopAutoMusic();
   if (!bgm.paused) { bgm.pause(); return; }
   musicToggle.disabled=true;
   try { await bgm.play(); }
@@ -279,3 +280,24 @@ musicToggle.addEventListener('click',async()=>{
 });
 bgm.addEventListener('play',syncMusic);bgm.addEventListener('pause',syncMusic);
 bgm.addEventListener('error',()=>{syncMusic();hint('音乐暂时无法播放，装饰和留言仍可正常使用');});
+
+let autoMusicPending=true;
+function stopAutoMusic(){
+  autoMusicPending=false;
+  document.removeEventListener('pointerdown',startMusicOnInteraction);
+  document.removeEventListener('keydown',startMusicOnInteraction);
+}
+async function tryAutoMusic(){
+  if (!autoMusicPending) return;
+  try { await bgm.play(); stopAutoMusic(); }
+  catch { /* 自动播放被浏览器拦截时不报错，等待用户交互。 */ }
+  finally { syncMusic(); }
+}
+function startMusicOnInteraction(event){
+  if (event.target?.closest?.('#music-toggle')) return;
+  if (event.type==='keydown' && !['Enter',' '].includes(event.key)) return;
+  tryAutoMusic();
+}
+document.addEventListener('pointerdown',startMusicOnInteraction);
+document.addEventListener('keydown',startMusicOnInteraction);
+tryAutoMusic();
