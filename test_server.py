@@ -163,6 +163,46 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.gift(self.b,tree,1)[0],201)
         self.assertEqual(self.request(self.a,'/api/trees/'+tree+'/ornaments/0/remove',{})[0],200)
         self.assertEqual(self.gift(self.b,tree,0)[1]['code'],'CAPACITY')
+    def test_owner_moves_private_gift_without_changing_message(self):
+        import sqlite3
+        tree=self.tree();path='/api/trees/'+tree
+        self.request(self.b,path+'/ornaments',{'point':0,'ornament':'candy','name':'朋友','text':'悄悄话','private':True})
+        source=self.request(self.a,path)[1]['ornaments'][0]
+        outsider=self.client()
+        self.assertNotIn('moveToken',self.request(outsider,path)[1]['ornaments'][0])
+        payload={'target':37,'moveToken':source['moveToken']}
+        self.assertEqual(self.request(self.b,path+'/ornaments/0/move',payload)[0],403)
+        self.assertEqual(self.request(self.a,path+'/ornaments/0/move',payload)[0],200)
+        entry=self.request(self.b,path)[1]['ornaments'][0]
+        self.assertEqual((entry['point'],entry['text'],entry['private']),(37,'悄悄话',True))
+        self.assertIsNone(self.request(outsider,path)[1]['ornaments'][0]['text'])
+        with sqlite3.connect(self.temp.name+'/test.db') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM gift_history').fetchone()[0],1)
+    def test_move_rejects_occupied_invalid_and_stale_source(self):
+        tree=self.tree();path='/api/trees/'+tree
+        self.gift(self.b,tree,0);self.gift(self.b,tree,1)
+        source=self.request(self.a,path)[1]['ornaments'][0]
+        route=path+'/ornaments/0/move';token=source['moveToken']
+        self.assertEqual(self.request(self.a,route,{'target':1,'moveToken':token})[1]['code'],'POINT_TAKEN')
+        for target in [True,-1,38,'2',2.5,None,0]:
+            self.assertEqual(self.request(self.a,route,{'target':target,'moveToken':token})[0],422)
+        self.request(self.a,path+'/ornaments/0/privacy',{'private':True})
+        self.assertEqual(self.request(self.a,route,{'target':2,'moveToken':token})[1]['code'],'STALE_GIFT')
+        token=self.request(self.a,path)[1]['ornaments'][0]['moveToken']
+        self.request(self.a,path+'/ornaments/0/remove',{})
+        self.request(self.b,path+'/ornaments',{'point':0,'ornament':'bell','name':'新朋友','text':'新留言'})
+        self.assertEqual(self.request(self.a,route,{'target':2,'moveToken':token})[1]['code'],'STALE_GIFT')
+        self.assertEqual(self.request(self.a,path)[1]['ornaments'][0]['text'],'新留言')
+    def test_two_moves_of_same_gift_only_one_succeeds(self):
+        from concurrent.futures import ThreadPoolExecutor
+        tree=self.tree();self.gift(self.b,tree)
+        path='/api/trees/'+tree
+        token=self.request(self.a,path)[1]['ornaments'][0]['moveToken']
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda target:self.request(self.a,path+'/ornaments/0/move',{'target':target,'moveToken':token})[0],[4,5]))
+        self.assertEqual(sorted(results),[200,409])
+        entries=self.request(self.b,path)[1]['ornaments']
+        self.assertEqual(len(entries),1);self.assertIn(entries[0]['point'],[4,5])
     def test_health_and_static_cache(self):
         self.assertEqual(self.request(self.a,'/healthz')[0],200)
         response=self.a.open(self.base+'/app.js')

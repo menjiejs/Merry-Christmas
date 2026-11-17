@@ -104,6 +104,11 @@ class TreeApp:
     def visitor(tree,token):
         return hashlib.sha256((tree+':'+token).encode()).hexdigest()
 
+    @staticmethod
+    def move_token(snapshot):
+        # 只给树主人返回的快照标记，避免旧页面误移走已替换的挂饰。
+        return hashlib.sha256(json.dumps(list(snapshot),ensure_ascii=True,separators=(',',':')).encode()).hexdigest()
+
     def developer(self,db,token):
         row=db.execute('SELECT anchor,visitor FROM developer_browser LIMIT 1').fetchone()
         return bool(row and secrets.compare_digest(self.visitor(row[0],token),row[1]))
@@ -203,6 +208,7 @@ class TreeApp:
                 can_read=not private or is_owner or secrets.compare_digest(sender,viewer)
                 entries.append({'point':point,'ornament':ornament,'name':name,
                                 'text':message if can_read else None,'private':bool(private),'canRead':bool(can_read)})
+                if is_owner: entries[-1]['moveToken']=self.move_token((point,ornament,name,message,sender,private))
             return 200,{'id':tree,'name':row[0],'hasGifted':gifted,'isDeveloper':developer,'isOwner':is_owner,'ornaments':entries},None
         if method!='POST': raise APIError(405,'METHOD','不支持这个操作')
         origin=e.get('HTTP_ORIGIN')
@@ -228,6 +234,25 @@ class TreeApp:
                     raise APIError(503,'CAPACITY','暂时无法种新树，请晚些再来；已有的树仍可查看')
                 db.execute('INSERT INTO trees(id,name,owner) VALUES (?,?,?)',(tree,data['name'].strip(),self.visitor(tree,token)))
             return 201,{'id':tree},None
+        movement=re.fullmatch(r'/api/trees/([A-Za-z0-9_-]{16})/ornaments/(\d{1,2})/move',path)
+        if movement:
+            tree,source=movement[1],int(movement[2])
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                owner=db.execute('SELECT owner FROM trees WHERE id=?',(tree,)).fetchone()
+                if not owner: raise APIError(404,'TREE_NOT_FOUND','这棵树不存在')
+                if not owner[0] or not secrets.compare_digest(owner[0],self.visitor(tree,token)):
+                    raise APIError(403,'OWNER_ONLY','只有树主人可以移动挂饰')
+                target=data.get('target'); snapshot_token=data.get('moveToken')
+                if type(target) is not int or not 0<=target<38 or target==source or not isinstance(snapshot_token,str) or not re.fullmatch('[a-f0-9]{64}',snapshot_token):
+                    raise APIError(422,'INVALID','请选择另一个空挂点')
+                gift=db.execute('SELECT point,ornament,name,text,visitor,private FROM ornaments WHERE tree=? AND point=?',(tree,source)).fetchone()
+                if not gift or not secrets.compare_digest(self.move_token(gift),snapshot_token):
+                    raise APIError(409,'STALE_GIFT','这枚挂饰已发生变化，请重新选择')
+                if db.execute('SELECT 1 FROM ornaments WHERE tree=? AND point=?',(tree,target)).fetchone():
+                    raise APIError(409,'POINT_TAKEN','这个位置已经有挂饰，请换一个位置')
+                db.execute('UPDATE ornaments SET point=? WHERE tree=? AND point=?',(target,tree,source))
+            return 200,{'ok':True},None
         privacy_change=re.fullmatch(r'/api/trees/([A-Za-z0-9_-]{16})/ornaments/(\d{1,2})/privacy',path)
         if privacy_change:
             tree,point=privacy_change[1],int(privacy_change[2])

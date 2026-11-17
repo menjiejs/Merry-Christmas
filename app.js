@@ -18,6 +18,7 @@ const treeId = location.pathname.match(/^\/tree\/([A-Za-z0-9_-]{16})$/)?.[1];
 let ready = false, sending = false;
 let selectedOrnament = null, pendingMessage = null;
 let isOwner = false, viewingPoint = null, openingMessage = false;
+let movingGift = null;
 const messages = new Map();
 const pointButtons = [];
 const rows = [[23,47,53,2],[30,44,56,3],[39,40,60,4],[48,35,65,5],[58,31,69,5],[68,26,74,6],[78,25,75,6],[88,18,82,7]];
@@ -70,7 +71,9 @@ function updateAction() {
 function cancelPlacement() {
   stage.classList.remove('choosing-point');
   $('cancel-placement').hidden = true;
-  selectedOrnament = null; pendingMessage = null;
+  selectedOrnament = null; pendingMessage = null; movingGift = null;
+  $('cancel-placement').textContent='暂时不挂';
+  stage.classList.remove('moving-gift');
 }
 function renderTree(data) {
   messages.clear();
@@ -99,6 +102,7 @@ function renderTree(data) {
 }
 function renderOpenedMessage(entry) {
   $('remove-message').hidden = !isOwner;
+  $('move-message').hidden = !isOwner;
   $('read-title').textContent = `来自 ${entry.name}`;
   $('message-visibility').textContent = entry.private ? '仅发送者和树主人可见' : '公开留言';
   $('message-content').textContent = entry.canRead ? entry.text : '这是一份悄悄送达的心意，只有发送者和树主人可以阅读。';
@@ -128,6 +132,7 @@ points.forEach(([x,y],index) => {
   button.setAttribute('aria-label',`选择第 ${index+1} 个挂点`);
   button.addEventListener('click', async () => {
     if (sending) return;
+    if (movingGift) { await moveGiftTo(index); return; }
     if (messages.has(index)) {
       if (openingMessage) return;
       openingMessage = true;
@@ -184,7 +189,7 @@ $('message-form').addEventListener('submit', event => {
   hint('轻点树上的圆点，为心意选个位置');
   pointButtons.find(button => !button.classList.contains('occupied'))?.focus();
 });
-$('cancel-placement').addEventListener('click', () => { if (!sending) {cancelPlacement(); hint('已暂时不挂，填写的留言仍保留着');} });
+$('cancel-placement').addEventListener('click', () => { if (!sending) {const wasMoving=Boolean(movingGift);cancelPlacement(); hint(wasMoving?'已取消移动，挂饰仍在原处':'暂时不挂，填写的留言仍保留着');} });
 $('close-ornaments').addEventListener('click', () => picker.close());
 $('cancel-message').addEventListener('click', () => messageDialog.close());
 $('close-message').addEventListener('click', () => $('read-dialog').close());
@@ -261,6 +266,52 @@ $('owner-private-message').addEventListener('change',async()=>{
     $('privacy-error').textContent=error.message;
   }
 });
+// 移动只改变位置，不会重新赠送或改动留言可见范围。
+$('move-message').addEventListener('click',async()=>{
+  if (!isOwner || viewingPoint===null || sending) return;
+  const source=viewingPoint;
+  const expectedToken=messages.get(source)?.moveToken;
+  $('move-message').disabled=true;
+  try {
+    await loadTree();
+    const entry=messages.get(source);
+    if (!entry || !entry.moveToken || entry.moveToken!==expectedToken) { hint('这枚挂饰已发生变化，请重新打开后再移动'); return; }
+    if (messages.size>=points.length) { $('remove-error').textContent='树上没有空挂点了，暂时无法移动'; return; }
+    cancelPlacement();
+    movingGift={source,moveToken:entry.moveToken};
+    $('read-dialog').close();
+    stage.classList.add('choosing-point','moving-gift');
+    $('cancel-placement').hidden=false;
+    $('cancel-placement').textContent='取消移动';
+    hint('点一个空圆点，把挂饰移到新位置');
+    pointButtons.find(button=>!button.classList.contains('occupied'))?.focus();
+  } catch(error) { $('remove-error').textContent=error.message; }
+  finally { $('move-message').disabled=false; }
+});
+async function moveGiftTo(target){
+  if (!movingGift || !isOwner) return;
+  if (messages.has(target)) { hint('请选择一个空圆点；如不移动，可点击取消移动'); return; }
+  const move={...movingGift};
+  sending=true;updateAction();
+  try {
+    await api(`/api/trees/${treeId}/ornaments/${move.source}/move`,{target,moveToken:move.moveToken});
+    const entry=messages.get(move.source);
+    if (entry) {
+      messages.delete(move.source);entry.point=target;messages.set(target,entry);
+      const old=pointButtons[move.source];old.classList.remove('occupied');old.replaceChildren();old.removeAttribute('title');
+      old.setAttribute('aria-label',`选择第 ${move.source+1} 个挂点`);
+      pointButtons[target].classList.add('occupied');paintGift(pointButtons[target],entry);
+      pointButtons[target].setAttribute('aria-label',`查看${entry.name}的留言`);
+    }
+    cancelPlacement();viewingPoint=null;
+    hint('挂饰已经移到新位置，留言和私密设置都保留了');
+    try { await loadTree(); } catch { /* 已保存，保留当前位置。 */ }
+  } catch(error) {
+    if (error.code==='STALE_GIFT' || error.code==='OWNER_ONLY') cancelPlacement();
+    try { await loadTree(); } catch { /* 保留页面供稍后重试。 */ }
+    hint(error.message);
+  } finally { sending=false;updateAction(); }
+}
 // 默认尝试播放；浏览器拦截时等待第一次页面交互，手动暂停后不再自动启动。
 const bgm=$('winter-bgm'), musicToggle=$('music-toggle');
 bgm.volume=.3;
